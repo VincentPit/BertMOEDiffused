@@ -1,0 +1,52 @@
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Checkpoints and results (mount as volumes instead)
+checkpoints/
+results/
+
+# HuggingFace cache (mount as volume instead)
+.cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets — never bake into image
+.env
+
+# LaTeX build artifacts
+proposal/*.aux
+proposal/*.log
+proposal/*.out
+proposal/*.pdf
+proposal/*.toc
+proposal/*.synctex.gz

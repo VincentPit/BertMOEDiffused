@@ -1,0 +1,110 @@
+version: "3.9"
+
+services:
+
+  # ── Training ───────────────────────────────────────────────────────────────
+  train:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bertdiffused:latest
+    container_name: bertdiffused_train
+    command: python train.py
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_TOKEN=${HF_TOKEN}
+      - WANDB_API_KEY=${WANDB_API_KEY}
+      - WANDB_PROJECT=${WANDB_PROJECT:-bertdiffused}
+      - WANDB_RUN_NAME=${WANDB_RUN_NAME:-run_001}
+    volumes:
+      - .:/workspace                              # live source code sync
+      - hf_cache:/workspace/.cache/huggingface    # persist downloaded weights
+      - ./checkpoints:/workspace/checkpoints      # persist checkpoints
+      - ./results:/workspace/results              # persist eval results
+    shm_size: "8gb"                               # needed for large DataLoader workers
+    ipc: host
+    tty: true
+
+  # ── Text Infilling Evaluation ──────────────────────────────────────────────
+  eval_infilling:
+    image: bertdiffused:latest
+    container_name: bertdiffused_infilling
+    command: >
+      python tasks/infilling.py
+        --diffusion_ckpt /workspace/checkpoints/bertdiffused
+        --steps 100
+        --n_samples 500
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - .:/workspace
+      - hf_cache:/workspace/.cache/huggingface
+      - ./checkpoints:/workspace/checkpoints
+      - ./results:/workspace/results
+    depends_on:
+      - train
+
+  # ── Keyword-Constrained Generation Evaluation ─────────────────────────────
+  eval_constrained:
+    image: bertdiffused:latest
+    container_name: bertdiffused_constrained
+    command: >
+      python tasks/constrained_gen.py
+        --diffusion_ckpt /workspace/checkpoints/bertdiffused
+        --steps 100
+        --n_samples 500
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - .:/workspace
+      - hf_cache:/workspace/.cache/huggingface
+      - ./checkpoints:/workspace/checkpoints
+      - ./results:/workspace/results
+    depends_on:
+      - train
+
+  # ── Full Comparison + Plots ────────────────────────────────────────────────
+  eval_compare:
+    image: bertdiffused:latest
+    container_name: bertdiffused_compare
+    command: >
+      python eval/compare.py
+        --diffusion_ckpt /workspace/checkpoints/bertdiffused
+        --output_dir /workspace/results
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - .:/workspace
+      - hf_cache:/workspace/.cache/huggingface
+      - ./checkpoints:/workspace/checkpoints
+      - ./results:/workspace/results
+
+  # ── Interactive Shell ──────────────────────────────────────────────────────
+  shell:
+    image: bertdiffused:latest
+    container_name: bertdiffused_shell
+    command: /bin/bash
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - .:/workspace
+      - hf_cache:/workspace/.cache/huggingface
+      - ./checkpoints:/workspace/checkpoints
+      - ./results:/workspace/results
+    stdin_open: true
+    tty: true
+
+# ── Named volumes ──────────────────────────────────────────────────────────────
+volumes:
+  hf_cache:
+    driver: local
