@@ -45,7 +45,8 @@ BertDiffused/
 ├── monitoring/
 │   └── __init__.py             # ModelMonitor: prediction metrics, data drift, validation
 ├── notebooks/
-│   └── BertDiffused_Colab.ipynb # Google Colab notebook (ETL + training + monitoring)
+│   ├── BertDiffused_Colab.ipynb # Google Colab notebook (ETL + training + monitoring)
+│   └── BertDiffused_Inference.ipynb # Inference demo (generation, infilling, analysis)
 ├── tasks/
 │   ├── infilling.py            # Task 1: text infilling benchmark
 │   └── constrained_gen.py      # Task 2: keyword-constrained generation
@@ -299,6 +300,18 @@ The notebook handles:
 - **Space-efficient checkpoints**: only LoRA adapters (~2.5 MB) are synced
   to Drive during training; one final merged model is saved at the end
 - Resume support (from VM checkpoint or Drive LoRA adapters)
+
+### Inference Demo
+
+[`notebooks/BertDiffused_Inference.ipynb`](notebooks/BertDiffused_Inference.ipynb) showcases
+the trained model's capabilities:
+
+- **Unconditional generation** — text from fully masked sequences
+- **Text infilling** — fill missing spans using bidirectional context
+- **Keyword-constrained generation** — guaranteed keyword satisfaction
+- **Denoising visualisation** — step-by-step reverse diffusion with colour-coded tokens
+- **MoE expert routing analysis** — expert specialisation across noise levels
+- **Steps vs quality** — quality/speed trade-off across T ∈ {10, 25, 50, 100, 200, 500}
 
 ### SUBS Post-processing
 
