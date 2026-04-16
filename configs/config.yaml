@@ -27,6 +27,17 @@ model:
     router_jitter: 0.01                  # noise added to router logits during training (exploration)
     use_expert_choice: false             # if true, experts pick tokens (alternative to token-choice top-k)
 
+  # LoRA (Low-Rank Adaptation) — parameter-efficient fine-tuning
+  lora:
+    enabled: true                        # set false to train full BERT (no LoRA)
+    rank: 8                              # low-rank dimension r (4–64 typical)
+    alpha: 16.0                          # scaling factor α; effective scale = α/r
+    dropout: 0.05                        # dropout on LoRA branch
+    target_modules:                      # which attention projections to adapt
+      - "query"
+      - "key"
+      - "value"
+
 diffusion:
   noise_schedule: "log_linear"           # alpha_t = 1 - t
   num_inference_steps: 1000             # T for reverse diffusion at eval
@@ -55,6 +66,16 @@ training:
   output_dir: "checkpoints/bert_moe_diffusion"
   resume_from_checkpoint: null
 
+# ETL pipeline settings
+etl:
+  output_dir: "data/processed"           # preprocessed Parquet shards
+  min_text_length: 20                    # discard texts shorter than this (chars)
+  max_text_length: 100000                # discard texts longer than this (chars)
+  deduplicate: true                      # exact-hash deduplication
+  num_proc: 4                            # parallel workers for .map()/.filter()
+  shard_size: 50000                      # samples per Parquet shard
+  max_samples: null                      # cap total samples (null = use all)
+
 evaluation:
   num_eval_samples: 1024                # samples for gen PPL / MAUVE
   eval_batch_size: 32
@@ -75,3 +96,23 @@ baselines:
       name: "MDLM-OWT (130M)"
     - id: "local"
       name: "BertDiffused-MoE (ours)"
+
+# MLflow configuration
+mlflow:
+  tracking_uri: "mlruns"                  # local dir; or "http://localhost:5000" for server
+  experiment_name: "BertMoEDiffusion"
+  run_name: null                          # auto-generated if null
+  registered_model_name: "BertMoEDiffusion"
+
+  # Model serving settings (used by `mlflow models serve`)
+  serving:
+    host: "0.0.0.0"
+    port: 8080
+    workers: 2
+
+  # Monitoring thresholds
+  monitoring:
+    max_bpd: 6.0
+    max_latency_ms: 5000.0
+    min_unique_ratio: 0.3
+    drift_js_threshold: 0.1

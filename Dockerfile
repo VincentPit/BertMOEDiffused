@@ -38,7 +38,11 @@ ENV HF_DATASETS_CACHE=/workspace/.cache/huggingface/datasets
 # ── Experiment output dirs ────────────────────────────────────────────────────
 RUN mkdir -p /workspace/checkpoints \
              /workspace/results \
-             /workspace/.cache/huggingface
+             /workspace/.cache/huggingface \
+             /workspace/mlruns
+
+# ── Expose MLflow serving port ────────────────────────────────────────────────
+EXPOSE 8080
 
 # ── Default command ───────────────────────────────────────────────────────────
 CMD ["python", "train.py"]

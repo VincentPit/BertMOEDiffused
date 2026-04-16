@@ -34,9 +34,18 @@ BertDiffused/
 ├── model/
 │   ├── noise_schedule.py       # log-linear α(t)=1−t, masking, posterior logits
 │   ├── moe_layer.py            # MoERouter + ExpertFFN + MoEFeedForward
-│   └── bert_moe_diffusion.py   # full model: BERT + time embed + MoE + SUBS
+│   ├── lora.py                 # LoRA adapter: LoRALinear, apply/merge utilities
+│   └── bert_moe_diffusion.py   # full model: BERT + time embed + MoE + LoRA + SUBS
 ├── data/
-│   └── lm1b_dataset.py         # LM1B dataset wrappers (map-style + streaming)
+│   ├── lm1b_dataset.py         # LM1B dataset wrappers (map-style + streaming)
+│   └── etl.py                  # ETL pipeline: extract → clean → dedup → tokenize → Parquet
+├── serving/
+│   ├── mlflow_pyfunc.py        # MLflow PyFunc model wrapper for production serving
+│   └── inference.py            # Model registry loading + text generation API
+├── monitoring/
+│   └── __init__.py             # ModelMonitor: prediction metrics, data drift, validation
+├── notebooks/
+│   └── BertDiffused_Colab.ipynb # Google Colab notebook (ETL + training + monitoring)
 ├── tasks/
 │   ├── infilling.py            # Task 1: text infilling benchmark
 │   └── constrained_gen.py      # Task 2: keyword-constrained generation
@@ -45,8 +54,10 @@ BertDiffused/
 ├── proposal/
 │   └── proposal.tex            # LaTeX proposal
 ├── configs/
-│   └── config.yaml             # all hyperparameters
-├── train.py                    # MDLM training loop with MoE aux loss
+│   └── config.yaml             # all hyperparameters (model, MoE, LoRA, ETL, MLflow)
+├── train.py                    # MDLM training loop with MLflow tracking + LoRA
+├── docker-compose.yml          # MLflow server, DB, training, ETL, serving services
+├── Dockerfile
 ├── requirements.txt
 └── README.md
 ```
@@ -65,29 +76,31 @@ cd BertDiffused
 
 # 1. Copy and fill in environment variables
 cp .env.example .env
-#    edit .env: set HF_TOKEN, WANDB_API_KEY, NVIDIA_VISIBLE_DEVICES
+#    edit .env: set HF_TOKEN, NVIDIA_VISIBLE_DEVICES
 
-# 2. Build the image
-docker compose build
+# 2. Start MLflow server + Postgres backend
+docker compose up -d mlflow-db mlflow-server
 
-# 3. Train
+# 3. Run ETL pipeline (downloads LM1B, cleans, deduplicates, shards to Parquet)
+docker compose run --rm etl
+
+# 4. Train (LoRA + MoE, tracked by MLflow)
 docker compose run --rm train
 
-# 4. Evaluate (infilling)
+# 5. Evaluate
 docker compose run --rm eval_infilling
-
-# 5. Evaluate (constrained generation)
 docker compose run --rm eval_constrained
-
-# 6. Full comparison + plots
 docker compose run --rm eval_compare
 
-# Interactive shell
-docker compose run --rm shell
+# 6. Serve model via MLflow
+docker compose up -d model-serving
+# API available at http://localhost:8080/invocations
 ```
 
+MLflow UI is available at **http://localhost:5000** after starting the server.
+
 HuggingFace model weights and checkpoints are persisted across runs via
-named volumes (`hf_cache`) and bind mounts (`./checkpoints`, `./results`).
+named volumes (`hf_cache`, `mlflow_db_data`, `mlflow_artifacts`).
 
 ### Option B — Local
 
@@ -99,20 +112,33 @@ cd BertDiffused
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # optional: set HF_TOKEN, WANDB_API_KEY
 ```
 
 ---
 
 ## Quickstart
 
-### 1. Train BertDiffused
+### 1. ETL Pipeline
+
+Download and preprocess LM1B into tokenized Parquet shards:
+
+```bash
+python -m data.etl --config configs/config.yaml
+```
+
+Output: `data/processed/{train,test}/shard-*.parquet`
+
+### 2. Train BertDiffused
 
 ```bash
 python train.py \
   --config configs/config.yaml \
   --output_dir checkpoints/bertdiffused
 ```
+
+Training is tracked by **MLflow** (local file store by default, or point
+`mlflow.tracking_uri` in config to a remote server). LoRA adapters are
+saved separately at each checkpoint (~2.5 MB each).
 
 Key hyperparameters (`configs/config.yaml`):
 
@@ -126,8 +152,9 @@ Key hyperparameters (`configs/config.yaml`):
 | MoE layers | {3, 5, 7, 9, 11} |
 | Experts / top-k | 8 / 2 |
 | Aux loss weights | lb=1e-2, z=1e-3 |
+| LoRA rank / alpha | 8 / 16 (Q, K, V) |
 
-### 2. Run Task 1 — Text Infilling
+### 3. Run Task 1 — Text Infilling
 
 ```bash
 python tasks/infilling.py \
@@ -138,7 +165,7 @@ python tasks/infilling.py \
 
 Reports BLEU-4, MAUVE, and Generative PPL across all four models.
 
-### 3. Run Task 2 — Keyword-Constrained Generation
+### 4. Run Task 2 — Keyword-Constrained Generation
 
 ```bash
 python tasks/constrained_gen.py \
@@ -149,7 +176,7 @@ python tasks/constrained_gen.py \
 
 Reports KW-Sat %, MAUVE, and Generative PPL across all four models.
 
-### 4. Full Comparison + Plots
+### 5. Full Comparison + Plots
 
 ```bash
 python eval/compare.py \
@@ -198,6 +225,80 @@ $$\mathcal{L} = \mathcal{L}_\text{NELBO} + \lambda_\text{lb}\,\mathcal{L}_\text{
 |---|---|
 | $\mathcal{L}_\text{lb}$ | Load-balancing — prevents expert collapse |
 | $\mathcal{L}_z$ | Z-loss — stabilizes router logit scale |
+
+---
+
+## LoRA (Parameter-Efficient Training)
+
+Base BERT weights are frozen; only LoRA adapters (rank-8 on Q/K/V) and MoE
+parameters are trained. This reduces trainable parameters from ~117M to ~51M.
+
+Configure in `configs/config.yaml`:
+
+```yaml
+model:
+  lora:
+    enabled: true
+    rank: 8
+    alpha: 16.0
+    dropout: 0.05
+    target_modules: ["query", "key", "value"]
+```
+
+After training, adapters can be merged into base weights for zero-overhead
+inference via `model.merge_lora()`.
+
+---
+
+## MLflow Integration
+
+MLflow provides experiment tracking, model registry, and serving.
+
+- **Tracking**: training metrics (ELBO, MoE aux loss, BPD), hyperparameters,
+  system metrics, and dataset lineage are logged automatically.
+- **Model Registry**: final models are registered with versioning.
+- **Serving**: production inference via `mlflow models serve` or the Docker
+  `model-serving` container (port 8080).
+- **Monitoring**: `monitoring.ModelMonitor` tracks prediction distributions
+  and detects data drift (Jensen-Shannon divergence).
+
+```bash
+# Launch MLflow UI
+mlflow ui --backend-store-uri ./mlruns --port 5000
+```
+
+---
+
+## ETL Pipeline
+
+The ETL pipeline (`data/etl.py`) preprocesses raw HuggingFace datasets
+into tokenized Parquet shards for efficient training:
+
+1. **Extract** — Download LM1B splits from HuggingFace Hub
+2. **Transform** — Unicode normalize, quality filter, SHA-256 deduplicate
+3. **Load** — Batch tokenize, write zstd-compressed Parquet shards
+
+```bash
+python -m data.etl --config configs/config.yaml
+```
+
+The processed data is used automatically by `train.py` when available.
+
+---
+
+## Google Colab
+
+A ready-to-run notebook is provided at
+[`notebooks/BertDiffused_Colab.ipynb`](notebooks/BertDiffused_Colab.ipynb).
+
+The notebook handles:
+- GPU verification, Drive mount, dependency installation
+- Full ETL pipeline (configurable sample count)
+- LoRA + MoE training with MLflow tracking
+- Live loss/BPD plots
+- **Space-efficient checkpoints**: only LoRA adapters (~2.5 MB) are synced
+  to Drive during training; one final merged model is saved at the end
+- Resume support (from VM checkpoint or Drive LoRA adapters)
 
 ### SUBS Post-processing
 

@@ -26,8 +26,11 @@ import logging
 import math
 import os
 import random
+import time
 from pathlib import Path
 
+import mlflow
+import mlflow.pytorch
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -40,6 +43,7 @@ from transformers import (
 
 from model import BertMoEDiffusion, LogLinearNoiseSchedule
 from data.lm1b_dataset import LM1BDataset
+from data.etl import ProcessedParquetDataset
 
 logger = logging.getLogger(__name__)
 
@@ -194,21 +198,67 @@ def train(cfg: dict) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
+    # ── MLflow setup ───────────────────────────────────────────────────────────
+    mlflow_cfg = cfg.get("mlflow", {})
+    tracking_uri = os.environ.get(
+        "MLFLOW_TRACKING_URI",
+        mlflow_cfg.get("tracking_uri", "mlruns"),
+    )
+    experiment_name = mlflow_cfg.get("experiment_name", "BertMoEDiffusion")
+    run_name = mlflow_cfg.get("run_name", None)
+    registry_model_name = mlflow_cfg.get("registered_model_name", "BertMoEDiffusion")
+
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_experiment(experiment_name)
+
+    # Enable system metrics logging (CPU/GPU/memory)
+    mlflow.enable_system_metrics_logging()
+
+    mlflow_run = mlflow.start_run(run_name=run_name)
+    logger.info(f"MLflow run started: {mlflow_run.info.run_id}")
+
+    # Log all config parameters (flattened)
+    mlflow.log_params(flatten_cfg(cfg))
+
+    # Log device info as tags
+    mlflow.set_tags({
+        "device": str(device),
+        "cuda_available": str(torch.cuda.is_available()),
+        "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A",
+    })
+
     # ── Tokenizer ──────────────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(cfg["model"]["backbone"])
     mask_token_id: int = tokenizer.mask_token_id
 
     # ── Dataset ────────────────────────────────────────────────────────────────
-    train_dataset = LM1BDataset(
-        split=cfg["training"]["dataset_split_train"],
-        tokenizer=tokenizer,
-        max_seq_len=cfg["model"]["max_seq_len"],
-    )
-    eval_dataset = LM1BDataset(
-        split=cfg["training"]["dataset_split_eval"],
-        tokenizer=tokenizer,
-        max_seq_len=cfg["model"]["max_seq_len"],
-    )
+    # Prefer preprocessed Parquet shards from ETL pipeline; fall back to raw
+    etl_output_dir = Path(cfg.get("etl", {}).get("output_dir", "data/processed"))
+    train_etl_dir = etl_output_dir / cfg["training"]["dataset_split_train"]
+    eval_etl_dir = etl_output_dir / cfg["training"]["dataset_split_eval"]
+
+    if train_etl_dir.exists() and any(train_etl_dir.glob("shard-*.parquet")):
+        logger.info(f"Using preprocessed ETL data from {train_etl_dir}")
+        train_dataset = ProcessedParquetDataset(train_etl_dir)
+        mlflow.set_tag("data_source", "etl_parquet")
+    else:
+        logger.info("No ETL shards found — using raw on-the-fly tokenization")
+        train_dataset = LM1BDataset(
+            split=cfg["training"]["dataset_split_train"],
+            tokenizer=tokenizer,
+            max_seq_len=cfg["model"]["max_seq_len"],
+        )
+        mlflow.set_tag("data_source", "raw_hf")
+
+    if eval_etl_dir.exists() and any(eval_etl_dir.glob("shard-*.parquet")):
+        eval_dataset = ProcessedParquetDataset(eval_etl_dir)
+    else:
+        eval_dataset = LM1BDataset(
+            split=cfg["training"]["dataset_split_eval"],
+            tokenizer=tokenizer,
+            max_seq_len=cfg["model"]["max_seq_len"],
+        )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg["training"]["batch_size"],
@@ -227,6 +277,9 @@ def train(cfg: dict) -> None:
 
     # ── Model ──────────────────────────────────────────────────────────────────
     moe_cfg = cfg["model"]["moe"]
+    lora_cfg = cfg["model"].get("lora", {})
+    lora_enabled = lora_cfg.get("enabled", False)
+
     model = BertMoEDiffusion(
         bert_model_name=cfg["model"]["backbone"],
         moe_layers=moe_cfg["moe_layers"],
@@ -239,28 +292,49 @@ def train(cfg: dict) -> None:
         time_embed_dim=cfg["model"]["time_embed_dim"],
         use_time_conditioning=cfg["model"]["use_time_conditioning"],
         dropout=cfg["model"]["dropout"],
+        lora_enabled=lora_enabled,
+        lora_rank=lora_cfg.get("rank", 8),
+        lora_alpha=lora_cfg.get("alpha", 16.0),
+        lora_dropout=lora_cfg.get("dropout", 0.05),
+        lora_target_modules=lora_cfg.get("target_modules", None),
     )
     model.set_mask_token_id(mask_token_id)
     model.to(device)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
-
-    # Log MoE parameter breakdown
-    moe_params = sum(
-        p.numel()
-        for moe_ffn in model.moe_layers_list
-        for p in moe_ffn.parameters()
+    # Parameter breakdown (LoRA-aware)
+    param_summary = model.trainable_parameters_summary()
+    logger.info(
+        f"Model parameters: {param_summary['total']:,} total, "
+        f"{param_summary['trainable']:,} trainable ({param_summary['trainable_pct']:.1f}%), "
+        f"{param_summary['frozen']:,} frozen"
     )
-    logger.info(f"MoE parameters: {moe_params:,} (across {len(model.moe_layers_list)} MoE layers)")
+    logger.info(f"MoE parameters: {param_summary['moe']:,} (across {len(model.moe_layers_list)} MoE layers)")
+    if lora_enabled:
+        logger.info(
+            f"LoRA parameters: {param_summary['lora']:,} "
+            f"(rank={lora_cfg.get('rank', 8)}, alpha={lora_cfg.get('alpha', 16.0)})"
+        )
+
+    # Log model architecture stats to MLflow
+    mlflow.log_metrics({
+        "model/total_params": param_summary["total"],
+        "model/trainable_params": param_summary["trainable"],
+        "model/frozen_params": param_summary["frozen"],
+        "model/trainable_pct": param_summary["trainable_pct"],
+        "model/moe_params": param_summary["moe"],
+        "model/lora_params": param_summary["lora"],
+        "model/num_moe_layers": len(model.moe_layers_list),
+    })
+    mlflow.set_tag("lora_enabled", str(lora_enabled))
 
     # ── Noise schedule ─────────────────────────────────────────────────────────
     noise_schedule = LogLinearNoiseSchedule()
 
     # ── Optimizer & scheduler ──────────────────────────────────────────────────
+    # Only pass trainable parameters to the optimizer (critical when using LoRA)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=cfg["training"]["learning_rate"],
         betas=(cfg["training"]["adam_beta1"], cfg["training"]["adam_beta2"]),
         eps=cfg["training"]["adam_epsilon"],
@@ -367,6 +441,15 @@ def train(cfg: dict) -> None:
                 f"Step {global_step:6d} | ELBO loss {avg_loss:.4f} | "
                 f"MoE aux {avg_moe:.4f} | LR {lr:.2e}"
             )
+            mlflow.log_metrics(
+                {
+                    "train/elbo_loss": avg_loss,
+                    "train/moe_aux_loss": avg_moe,
+                    "train/learning_rate": lr,
+                    "train/epoch": global_step / len(train_loader),
+                },
+                step=global_step,
+            )
             running_loss = 0.0
             running_moe_loss = 0.0
 
@@ -376,6 +459,7 @@ def train(cfg: dict) -> None:
                 model, eval_loader, noise_schedule, mask_token_id, device, time_eps=time_eps
             )
             logger.info(f"Step {global_step:6d} | Eval BPD: {bpd:.4f}")
+            mlflow.log_metric("eval/bpd", bpd, step=global_step)
             model.train()
 
         # ── Checkpoint ─────────────────────────────────────────────────────────
@@ -392,11 +476,49 @@ def train(cfg: dict) -> None:
                 ckpt_path,
             )
             logger.info(f"Saved checkpoint → {ckpt_path}")
+            mlflow.log_artifact(str(ckpt_path), artifact_path="checkpoints")
 
     # ── Final save ─────────────────────────────────────────────────────────────
+    # Save LoRA adapters separately (lightweight checkpoint for sharing)
+    if lora_enabled and model.lora_enabled:
+        lora_path = output_dir / "lora_adapters.pt"
+        lora_state = {
+            k: v for k, v in model.state_dict().items()
+            if "lora_A" in k or "lora_B" in k
+        }
+        torch.save({"lora_state_dict": lora_state, "config": cfg}, lora_path)
+        logger.info(f"LoRA adapters saved → {lora_path}")
+        mlflow.log_artifact(str(lora_path), artifact_path="lora_adapters")
+
+        # Merge LoRA into base weights for efficient inference
+        model.merge_lora()
+        logger.info("LoRA weights merged into base model for inference.")
+
     final_path = output_dir / "final_model.pt"
     torch.save({"model": model.state_dict(), "config": cfg}, final_path)
     logger.info(f"Training complete. Final model saved → {final_path}")
+
+    # ── MLflow: log final model to Model Registry ─────────────────────────────
+    # Log the model with a custom PyFunc wrapper for serving
+    mlflow.log_artifact(str(final_path), artifact_path="final_model")
+    mlflow.log_artifact("configs/config.yaml", artifact_path="config")
+
+    # Register model via MLflow PyTorch flavor
+    mlflow.pytorch.log_model(
+        pytorch_model=model,
+        artifact_path="model",
+        registered_model_name=registry_model_name,
+        pip_requirements=[
+            "torch>=2.2.0",
+            "transformers>=4.40.0",
+            "mlflow>=2.14.0",
+        ],
+    )
+    logger.info(f"Model registered in MLflow as '{registry_model_name}'")
+
+    # End MLflow run
+    mlflow.end_run()
+    logger.info("MLflow run ended.")
 
 
 # ─── CLI entry point ──────────────────────────────────────────────────────────

@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from transformers import BertConfig, BertForMaskedLM
 
 from .moe_layer import MoEFeedForward
+from .lora import LoRALinear, apply_lora_to_module, merge_lora_weights
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +104,11 @@ class BertMoEDiffusion(nn.Module):
         time_embed_dim:         Sinusoidal embedding dimension (projected to hidden_size).
         use_time_conditioning:  Whether to inject the time embedding into tokens.
         dropout:                Dropout in expert FFNs.
+        lora_enabled:           Whether to apply LoRA adapters to attention layers.
+        lora_rank:              Rank of LoRA low-rank decomposition.
+        lora_alpha:             LoRA scaling factor (effective scale = alpha/rank).
+        lora_dropout:           Dropout in LoRA branch.
+        lora_target_modules:    Which linear layers to apply LoRA to.
     """
 
     def __init__(
@@ -118,6 +124,11 @@ class BertMoEDiffusion(nn.Module):
         time_embed_dim: int = 128,
         use_time_conditioning: bool = True,
         dropout: float = 0.1,
+        lora_enabled: bool = False,
+        lora_rank: int = 8,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.05,
+        lora_target_modules: Optional[List[str]] = None,
     ) -> None:
         super().__init__()
 
@@ -176,6 +187,81 @@ class BertMoEDiffusion(nn.Module):
 
         # Accumulated MoE auxiliary loss from the last forward pass
         self.moe_aux_loss: torch.Tensor = torch.tensor(0.0)
+
+        # ── LoRA adapters on attention projections ────────────────────────────
+        self.lora_enabled = lora_enabled
+        self.lora_layers: dict = {}
+        if lora_enabled:
+            if lora_target_modules is None:
+                lora_target_modules = ["query", "key", "value"]
+            self.lora_layers = apply_lora_to_module(
+                self.bert,
+                target_modules=lora_target_modules,
+                rank=lora_rank,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+            )
+            # Freeze all BERT parameters except LoRA, MoE, and time embedding
+            self._freeze_base_bert()
+
+    # ── Freeze / unfreeze helpers ────────────────────────────────────────────
+
+    def _freeze_base_bert(self) -> None:
+        """Freeze all base BERT parameters. Only LoRA, MoE, and time embedding remain trainable."""
+        # First, freeze everything in self.bert
+        for param in self.bert.parameters():
+            param.requires_grad = False
+
+        # Unfreeze LoRA parameters
+        for lora_layer in self.lora_layers.values():
+            lora_layer.lora_A.requires_grad = True
+            lora_layer.lora_B.requires_grad = True
+
+        # Unfreeze MoE layers
+        for moe_ffn in self.moe_layers_list:
+            for param in moe_ffn.parameters():
+                param.requires_grad = True
+
+        # Unfreeze MoE wrapper LayerNorms
+        for layer_idx in self.moe_layer_indices:
+            bert_layer = self.bert.bert.encoder.layer[layer_idx]
+            if hasattr(bert_layer.output, "layer_norm"):
+                for param in bert_layer.output.layer_norm.parameters():
+                    param.requires_grad = True
+
+        # Unfreeze time embedding (new parameters, not pretrained)
+        if self.time_embed is not None:
+            for param in self.time_embed.parameters():
+                param.requires_grad = True
+
+    def merge_lora(self) -> None:
+        """Merge LoRA weights into base BERT for zero-overhead inference."""
+        if self.lora_enabled and self.lora_layers:
+            merge_lora_weights(self.bert)
+            self.lora_layers = {}
+            self.lora_enabled = False
+
+    def trainable_parameters_summary(self) -> dict:
+        """Return a dict summarizing total vs. trainable parameter counts."""
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen = total - trainable
+        lora_params = sum(
+            p.numel() for name, p in self.named_parameters()
+            if "lora_" in name and p.requires_grad
+        )
+        moe_params = sum(
+            p.numel() for moe_ffn in self.moe_layers_list
+            for p in moe_ffn.parameters() if p.requires_grad
+        )
+        return {
+            "total": total,
+            "trainable": trainable,
+            "frozen": frozen,
+            "lora": lora_params,
+            "moe": moe_params,
+            "trainable_pct": 100.0 * trainable / total if total > 0 else 0.0,
+        }
 
     # ── Forward pass ──────────────────────────────────────────────────────────
 

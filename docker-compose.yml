@@ -2,6 +2,62 @@ version: "3.9"
 
 services:
 
+  # ── MLflow Tracking Server ─────────────────────────────────────────────────
+  mlflow-db:
+    image: postgres:16-alpine
+    container_name: bertdiffused_mlflow_db
+    environment:
+      POSTGRES_DB: mlflow
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: ${MLFLOW_DB_PASSWORD:-mlflow}
+    volumes:
+      - mlflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow"]
+      interval: 5s
+      retries: 5
+
+  mlflow-server:
+    image: ghcr.io/mlflow/mlflow:v2.14.0
+    container_name: bertdiffused_mlflow
+    command: >
+      mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri postgresql://mlflow:${MLFLOW_DB_PASSWORD:-mlflow}@mlflow-db:5432/mlflow
+        --default-artifact-root /mlflow/artifacts
+        --serve-artifacts
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    depends_on:
+      mlflow-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      retries: 5
+
+  # ── ETL Pipeline ─────────────────────────────────────────────────────────
+  etl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bertdiffused:latest
+    container_name: bertdiffused_etl
+    command: python data/etl.py --splits train test
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
+    volumes:
+      - .:/workspace
+      - hf_cache:/workspace/.cache/huggingface
+      - ./data/processed:/workspace/data/processed
+    depends_on:
+      mlflow-server:
+        condition: service_healthy
+
   # ── Training ───────────────────────────────────────────────────────────────
   train:
     build:
@@ -15,9 +71,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - HF_TOKEN=${HF_TOKEN}
-      - WANDB_API_KEY=${WANDB_API_KEY}
-      - WANDB_PROJECT=${WANDB_PROJECT:-bertdiffused}
-      - WANDB_RUN_NAME=${WANDB_RUN_NAME:-run_001}
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
     volumes:
       - .:/workspace                              # live source code sync
       - hf_cache:/workspace/.cache/huggingface    # persist downloaded weights
@@ -26,6 +80,9 @@ services:
     shm_size: "8gb"                               # needed for large DataLoader workers
     ipc: host
     tty: true
+    depends_on:
+      mlflow-server:
+        condition: service_healthy
 
   # ── Text Infilling Evaluation ──────────────────────────────────────────────
   eval_infilling:
@@ -40,6 +97,7 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - HF_TOKEN=${HF_TOKEN}
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
     volumes:
       - .:/workspace
       - hf_cache:/workspace/.cache/huggingface
@@ -61,6 +119,7 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - HF_TOKEN=${HF_TOKEN}
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
     volumes:
       - .:/workspace
       - hf_cache:/workspace/.cache/huggingface
@@ -81,11 +140,36 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - HF_TOKEN=${HF_TOKEN}
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
     volumes:
       - .:/workspace
       - hf_cache:/workspace/.cache/huggingface
       - ./checkpoints:/workspace/checkpoints
       - ./results:/workspace/results
+
+  # ── MLflow Model Serving ───────────────────────────────────────────────────
+  model-serving:
+    image: bertdiffused:latest
+    container_name: bertdiffused_serving
+    command: >
+      mlflow models serve
+        --model-uri models:/BertMoEDiffusion/latest
+        --host 0.0.0.0
+        --port 8080
+        --no-conda
+        --workers 2
+    ports:
+      - "${SERVING_PORT:-8080}:8080"
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
+    volumes:
+      - .:/workspace
+      - hf_cache:/workspace/.cache/huggingface
+    depends_on:
+      mlflow-server:
+        condition: service_healthy
 
   # ── Interactive Shell ──────────────────────────────────────────────────────
   shell:
@@ -96,6 +180,7 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - HF_TOKEN=${HF_TOKEN}
+      - MLFLOW_TRACKING_URI=http://mlflow-server:5000
     volumes:
       - .:/workspace
       - hf_cache:/workspace/.cache/huggingface
@@ -107,4 +192,8 @@ services:
 # ── Named volumes ──────────────────────────────────────────────────────────────
 volumes:
   hf_cache:
+    driver: local
+  mlflow_db_data:
+    driver: local
+  mlflow_artifacts:
     driver: local
