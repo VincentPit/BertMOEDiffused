@@ -57,6 +57,7 @@ BertDiffused/
 ├── configs/
 │   └── config.yaml             # all hyperparameters (model, MoE, LoRA, ETL, MLflow)
 ├── train.py                    # MDLM training loop with MLflow tracking + LoRA
+├── test_smoke.py               # standalone 11-test CPU smoke test (no GPU needed)
 ├── docker-compose.yml          # MLflow server, DB, training, ETL, serving services
 ├── Dockerfile
 ├── requirements.txt
@@ -152,8 +153,10 @@ Key hyperparameters (`configs/config.yaml`):
 | Learning rate | 5e-5 |
 | MoE layers | {3, 5, 7, 9, 11} |
 | Experts / top-k | 8 / 2 |
-| Aux loss weights | lb=1e-2, z=1e-3 |
+| Aux loss weights | lb=5e-2, z=1e-2 |
 | LoRA rank / alpha | 8 / 16 (Q, K, V) |
+| Router jitter | 0.1 |
+| t clamp range | [1e-3, 1−1e-3] |
 
 ### 3. Run Task 1 — Text Infilling
 
@@ -197,7 +200,9 @@ Produces:
 
 ### Masked Diffusion (MDLM)
 
-Forward process independently masks each token at time $t \in [0,1]$:
+Forward process independently masks each token at time $t \in [0,1]$ (sampled
+with stratified low-discrepancy sampling; clamped to $[10^{-3}, 1-10^{-3}]$ to
+prevent unbounded $1/t$ weights that cause fp16 overflow):
 
 $$q(\mathbf{z}_t \mid \mathbf{x}) = \prod_\ell \mathrm{Cat}(z_t^\ell;\;\alpha(t)\,x^\ell + (1-\alpha(t))\,[\texttt{MASK}])$$
 
@@ -251,6 +256,19 @@ inference via `model.merge_lora()`.
 
 ---
 
+## Sparse Upcycling
+
+MoE experts are initialized from pretrained BERT FFN weights rather than from
+random weights (Komatsuzaki et al., 2023). Each expert's `fc1`/`fc2` matrices
+are copied from the corresponding dense BERT layer, then diversified with small
+Gaussian noise (σ = 0.01). The pretrained LayerNorm is also copied into the
+MoE output wrapper.
+
+This gives the MoE model a strong starting point, reducing the number of steps
+needed to recover the pretrained BERT quality and making early training more stable.
+
+---
+
 ## MLflow Integration
 
 MLflow provides experiment tracking, model registry, and serving.
@@ -296,10 +314,23 @@ The notebook handles:
 - GPU verification, Drive mount, dependency installation
 - Full ETL pipeline (configurable sample count)
 - LoRA + MoE training with MLflow tracking
+- **AnomalyWatcher**: halts training on NaN/Inf loss, loss spike (5×), loss
+  plateau (5 000 steps), MoE aux runaway, or gradient norm explosion;
+  saves an emergency checkpoint to Drive before stopping
 - Live loss/BPD plots
+- **Best-model checkpointing**: saves the checkpoint with the lowest eval BPD
+  to Drive throughout training (not just the final weights)
+- **Full test-set evaluation**: after training, loads the best checkpoint and
+  runs BPD over the entire test split before merging LoRA
+- **Persistent dataset cache**: `HF_DATASETS_CACHE` and `HF_HOME` are pointed
+  at Drive so LM1B is never re-downloaded on session restart
 - **Space-efficient checkpoints**: only LoRA adapters (~2.5 MB) are synced
   to Drive during training; one final merged model is saved at the end
 - Resume support (from VM checkpoint or Drive LoRA adapters)
+- **Smoke test** (Section 12): 11 end-to-end CPU tests covering imports,
+  tokenizer, model construction, noise schedule, forward pass, MDLM loss,
+  MoE aux loss, backward pass, mini training loop, SUBS carry-over, and
+  LoRA merge — runs without GPU, does not touch the trained model
 
 ### Inference Demo
 
@@ -371,11 +402,25 @@ Applied to raw MLM head logits after every forward pass:
 
 ## References
 
-- Sahoo et al. (2024) — [Simple and Effective Masked Diffusion Language Models](https://arxiv.org/abs/2406.07524) *(MDLM)*
-- Devlin et al. (2019) — [BERT](https://arxiv.org/abs/1810.04805)
-- Fedus et al. (2021) — [Switch Transformers](https://arxiv.org/abs/2101.03961)
-- Zoph et al. (2022) — [ST-MoE](https://arxiv.org/abs/2202.08906)
+**Masked Diffusion**
+- Sahoo et al. (2024) — [Simple and Effective Masked Diffusion Language Models](https://arxiv.org/abs/2406.07524) *(MDLM — log-linear schedule, SUBS parameterization, t-clamp ε = 1e-3)*
+- Austin et al. (2021) — [Structured Denoising Diffusion Models in Discrete State-Spaces](https://arxiv.org/abs/2107.03006) *(D3PM — absorbing diffusion)*
 - He et al. (2022) — [DiffusionBERT](https://arxiv.org/abs/2211.15029)
 - Li et al. (2022) — [Diffusion-LM](https://arxiv.org/abs/2205.14217)
-- Pillutla et al. (2021) — [MAUVE](https://arxiv.org/abs/2102.01454)
-- Lu et al. (2021) — [NeuroLogic Decoding](https://arxiv.org/abs/2010.12884)
+
+**Mixture of Experts**
+- Fedus et al. (2021) — [Switch Transformers](https://arxiv.org/abs/2101.03961) *(load-balancing auxiliary loss)*
+- Zoph et al. (2022) — [ST-MoE](https://arxiv.org/abs/2202.08906) *(z-loss for router stability)*
+- Komatsuzaki et al. (2023) — [Sparse Upcycling: Training Mixture-of-Experts from Dense Checkpoints](https://arxiv.org/abs/2212.05055) *(expert initialization from pretrained FFN weights)*
+- Shazeer et al. (2017) — [Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer](https://arxiv.org/abs/1701.06538) *(top-k routing)*
+
+**Base Model & Parameter-Efficient Training**
+- Devlin et al. (2019) — [BERT](https://arxiv.org/abs/1810.04805)
+- Hu et al. (2022) — [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685)
+
+**Evaluation**
+- Pillutla et al. (2021) — [MAUVE: Measuring the Gap Between Neural Text and Human Text using Divergence Frontiers](https://arxiv.org/abs/2102.01454)
+- Lu et al. (2021) — [NeuroLogic Decoding: (Un)supervised Neural Text Generation with Predicate Logic Constraints](https://arxiv.org/abs/2010.12884)
+
+**Dataset**
+- Chelba et al. (2014) — [One Billion Word Benchmark for Measuring Progress in Statistical Language Modeling](https://arxiv.org/abs/1312.3005) *(LM1B)*
