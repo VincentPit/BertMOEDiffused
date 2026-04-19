@@ -37,7 +37,7 @@ class LoRALinear(nn.Module):
     def __init__(
         self,
         original_linear: nn.Linear,
-        rank: int = 8,
+        rank: int = 16,
         alpha: float = 16.0,
         dropout: float = 0.0,
     ) -> None:

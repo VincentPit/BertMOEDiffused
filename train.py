@@ -340,15 +340,18 @@ def train(cfg: dict) -> None:
         eps=cfg["training"]["adam_epsilon"],
         weight_decay=cfg["training"]["weight_decay"],
     )
+    # Scheduler counts optimizer steps (actual weight updates), not raw global steps.
+    # Divide both warmup and total steps by gradient_accumulation_steps.
+    _accum = cfg["training"]["gradient_accumulation_steps"]
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=cfg["training"]["warmup_steps"],
-        num_training_steps=cfg["training"]["max_steps"],
+        num_warmup_steps=cfg["training"]["warmup_steps"] // _accum,
+        num_training_steps=cfg["training"]["max_steps"] // _accum,
     )
 
     # ── Mixed precision ────────────────────────────────────────────────────────
     use_fp16 = cfg["training"]["fp16"] and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_fp16)
 
     # ── Resume from checkpoint ─────────────────────────────────────────────────
     global_step = 0
@@ -367,7 +370,7 @@ def train(cfg: dict) -> None:
     log_steps = cfg["training"]["log_steps"]
     eval_steps = cfg["training"]["eval_steps"]
     save_steps = cfg["training"]["save_steps"]
-    time_eps = cfg["diffusion"]["time_eps"]
+    time_eps = float(cfg["diffusion"]["time_eps"])
 
     model.train()
     optimizer.zero_grad()
@@ -399,7 +402,7 @@ def train(cfg: dict) -> None:
         z_t = noise_schedule.noise_sequence(input_ids, t, mask_token_id)
 
         # ── Forward pass ───────────────────────────────────────────────────────
-        with torch.cuda.amp.autocast(enabled=use_fp16):
+        with torch.amp.autocast("cuda", enabled=use_fp16):
             logits = model(z_t, t, attention_mask=attention_mask)  # (B, L, V)
 
             # MDLM ELBO loss
@@ -425,9 +428,13 @@ def train(cfg: dict) -> None:
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), cfg["training"]["max_grad_norm"]
             )
+            _scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            # Only step scheduler when the optimizer actually updated weights
+            # (GradScaler skips optimizer.step() on inf/nan, reducing the scale)
+            if scaler.get_scale() == _scale_before:
+                scheduler.step()
             optimizer.zero_grad()
 
         global_step += 1

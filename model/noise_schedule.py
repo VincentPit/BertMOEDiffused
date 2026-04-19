@@ -78,8 +78,9 @@ class LogLinearNoiseSchedule:
             t = t % 1.0                       # wrap into [0, 1)
         else:
             t = torch.rand(batch_size, device=device)
-        # Avoid t=0 (undefined weight) and t=1 (all masked, zero gradient)
-        t = t.clamp(1e-5, 1.0 - 1e-5)
+        # Avoid t≈0 (unbounded 1/t weight → fp16 overflow) and t≈1 (zero gradient).
+        # 1e-3 matches the ε recommended by Sahoo et al. (MDLM, NeurIPS 2024).
+        t = t.clamp(1e-3, 1.0 - 1e-3)
         return t
 
     def noise_sequence(

@@ -21,10 +21,10 @@ model:
     num_experts: 8                       # total number of feed-forward experts per MoE layer
     num_experts_per_token: 2             # top-k routing (sparse MoE)
     moe_layers: [3, 5, 7, 9, 11]        # which transformer layers to replace FFN with MoE
-    router_z_loss_coef: 0.001           # auxiliary z-loss weight for router stability
-    router_aux_loss_coef: 0.01          # auxiliary load-balancing loss coefficient
+    router_z_loss_coef: 0.01            # auxiliary z-loss weight for router stability (increased 10x to combat expert collapse)
+    router_aux_loss_coef: 0.05          # auxiliary load-balancing loss coefficient (increased 5x to combat expert collapse)
     expert_hidden_multiplier: 4          # each expert's inner dim = hidden_size * multiplier
-    router_jitter: 0.01                  # noise added to router logits during training (exploration)
+    router_jitter: 0.1                   # noise added to router logits during training (increased for more exploration)
     use_expert_choice: false             # if true, experts pick tokens (alternative to token-choice top-k)
 
   # LoRA (Low-Rank Adaptation) — parameter-efficient fine-tuning
@@ -42,7 +42,7 @@ diffusion:
   noise_schedule: "log_linear"           # alpha_t = 1 - t
   num_inference_steps: 1000             # T for reverse diffusion at eval
   num_inference_steps_fast: 100         # T for fast eval runs
-  time_eps: 1e-4                        # avoid t=0 singularity in 1/t weighting
+  time_eps: 1.0e-4                      # avoid t=0 singularity in 1/t weighting
 
 training:
   dataset: "lm1b"                       # HuggingFace dataset ID

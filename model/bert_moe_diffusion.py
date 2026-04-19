@@ -341,7 +341,8 @@ class BertMoEDiffusion(nn.Module):
             # Build one-hot logits: large positive at input token, -inf elsewhere
             one_hot = torch.full_like(logits, float('-inf'))
             idx = z_t[is_unmasked].unsqueeze(-1)           # (M, 1)
-            one_hot[is_unmasked] = one_hot[is_unmasked].scatter(-1, idx, 1e9)
+            fill_val = 6.0e4 if logits.dtype == torch.float16 else 1e9
+            one_hot[is_unmasked] = one_hot[is_unmasked].scatter(-1, idx, fill_val)
             logits[is_unmasked] = one_hot[is_unmasked]
 
         return logits
@@ -488,10 +489,49 @@ def _patch_bert_layer_with_moe(
     moe_ffn: MoEFeedForward,
     hidden_size: int,
     dropout: float,
+    upcycle_noise: float = 0.01,
 ) -> None:
-    """Replace a BertLayer's FFN sub-modules in-place with MoE equivalents."""
+    """Replace a BertLayer's FFN sub-modules in-place with MoE equivalents.
+
+    Sparse upcycling (Komatsuzaki et al., 2023): each expert is initialised
+    from the pretrained BERT FFN weights + small Gaussian noise for
+    diversification, rather than random init.  The pretrained LayerNorm is
+    also copied into the MoE output wrapper.
+    """
+    # ── 1. Extract pretrained weights BEFORE replacing sub-modules ────────────
+    fc1_w = bert_layer.intermediate.dense.weight.data.clone()  # (intermediate, hidden)
+    fc1_b = bert_layer.intermediate.dense.bias.data.clone()    # (intermediate,)
+    fc2_w = bert_layer.output.dense.weight.data.clone()        # (hidden, intermediate)
+    fc2_b = bert_layer.output.dense.bias.data.clone()          # (hidden,)
+    ln_w  = bert_layer.output.LayerNorm.weight.data.clone()    # (hidden,)
+    ln_b  = bert_layer.output.LayerNorm.bias.data.clone()      # (hidden,)
+
+    # ── 2. Copy into each expert with small diversification noise ─────────────
+    # Only upcycle if the expert intermediate_size matches the pretrained FFN.
+    # (They match when expert_hidden_multiplier == bert_config.intermediate_size / hidden_size.)
+    can_upcycle = (
+        moe_ffn.experts[0].fc1.weight.shape == fc1_w.shape and
+        moe_ffn.experts[0].fc2.weight.shape == fc2_w.shape
+    )
+    if can_upcycle:
+        for expert in moe_ffn.experts:
+            expert.fc1.weight.data.copy_(fc1_w)
+            expert.fc1.weight.data += torch.randn_like(fc1_w) * upcycle_noise
+            expert.fc1.bias.data.copy_(fc1_b)
+
+            expert.fc2.weight.data.copy_(fc2_w)
+            expert.fc2.weight.data += torch.randn_like(fc2_w) * upcycle_noise
+            expert.fc2.bias.data.copy_(fc2_b)
+
+    # ── 3. Replace the BERT layer sub-modules ─────────────────────────────────
     bert_layer.intermediate = _IdentityIntermediate()
-    bert_layer.output = _MoEBertOutput(moe_ffn, hidden_size, dropout)
+    moe_output = _MoEBertOutput(moe_ffn, hidden_size, dropout)
+
+    # Copy pretrained LayerNorm weights into the MoE wrapper
+    moe_output.layer_norm.weight.data.copy_(ln_w)
+    moe_output.layer_norm.bias.data.copy_(ln_b)
+
+    bert_layer.output = moe_output
 
 
 # ---------------------------------------------------------------------------

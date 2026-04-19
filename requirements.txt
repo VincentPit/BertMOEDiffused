@@ -4,7 +4,8 @@ torchvision>=0.17.0
 
 # HuggingFace ecosystem
 transformers>=4.40.0
-datasets>=2.19.0
+datasets>=2.19.0,<3.0.0
+fsspec>=2025.3.0          # must match gcsfs requirement on Colab
 accelerate>=0.29.0
 
 # Tokenisation

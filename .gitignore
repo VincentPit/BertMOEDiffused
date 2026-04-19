@@ -2,3 +2,9 @@
 .env
 proposal/
 data/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+checkpoints/
+mlruns/
