@@ -8,3 +8,12 @@ __pycache__/
 .DS_Store
 checkpoints/
 mlruns/
+
+# Large model weights and generated evaluation artifacts
+best_model/
+results/
+*.pt
+*.ckpt
+
+# Jupyter
+.ipynb_checkpoints/

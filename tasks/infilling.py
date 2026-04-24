@@ -232,17 +232,36 @@ def compute_bleu(hypotheses: List[str], references: List[str]) -> float:
     return result.score
 
 
+# Module-level scorer cache: (model_name, device_str) → (tokenizer, model).
+# The scorer is reused across every call to compute_generative_ppl so we don't
+# re-download the weights or re-move them to GPU for every model we evaluate.
+_SCORER_CACHE: dict = {}
+
+
+def _get_scorer(scorer_model_name: str, device: torch.device):
+    """Load-and-cache a GPT-2 scorer model + tokenizer for gen-PPL evaluation."""
+    key = (scorer_model_name, str(device))
+    if key not in _SCORER_CACHE:
+        tok = AutoTokenizer.from_pretrained(scorer_model_name)
+        tok.pad_token = tok.eos_token
+        mdl = AutoModelForCausalLM.from_pretrained(scorer_model_name).to(device)
+        mdl.eval()
+        _SCORER_CACHE[key] = (tok, mdl)
+    return _SCORER_CACHE[key]
+
+
 def compute_generative_ppl(
     texts: List[str],
     scorer_model_name: str = "gpt2",
     device: torch.device = torch.device("cpu"),
     batch_size: int = 8,
 ) -> float:
-    """Compute mean perplexity of generated texts under a GPT-2 scorer."""
-    scorer_tok = AutoTokenizer.from_pretrained(scorer_model_name)
-    scorer_tok.pad_token = scorer_tok.eos_token
-    scorer_model = AutoModelForCausalLM.from_pretrained(scorer_model_name).to(device)
-    scorer_model.eval()
+    """Compute mean perplexity of generated texts under a GPT-2 scorer.
+
+    The scorer is cached at module level (see ``_SCORER_CACHE``); repeated calls
+    with the same ``scorer_model_name`` + ``device`` reuse the loaded weights.
+    """
+    scorer_tok, scorer_model = _get_scorer(scorer_model_name, device)
 
     all_ppls = []
     for i in range(0, len(texts), batch_size):
@@ -257,10 +276,8 @@ def compute_generative_ppl(
 
         with torch.no_grad():
             outputs = scorer_model(**enc, labels=enc["input_ids"])
-            # outputs.loss is the mean NLL over the batch
             nll = outputs.loss.item()
 
-        # Convert mean NLL to mean PPL for this batch
         all_ppls.append(np.exp(nll))
 
     return float(np.mean(all_ppls))

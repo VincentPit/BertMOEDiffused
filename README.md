@@ -45,13 +45,15 @@ BertDiffused/
 ├── monitoring/
 │   └── __init__.py             # ModelMonitor: prediction metrics, data drift, validation
 ├── notebooks/
-│   ├── BertDiffused_Colab.ipynb # Google Colab notebook (ETL + training + monitoring)
-│   └── BertDiffused_Inference.ipynb # Inference demo (generation, infilling, analysis)
+│   ├── BertDiffused_Colab.ipynb     # Google Colab notebook (ETL + training + monitoring)
+│   ├── BertDiffused_Inference.ipynb # Inference demo (generation, infilling, analysis)
+│   └── BertDiffused_Baselines.ipynb # Baseline comparison on LM1B test set (no training)
 ├── tasks/
 │   ├── infilling.py            # Task 1: text infilling benchmark
 │   └── constrained_gen.py      # Task 2: keyword-constrained generation
 ├── eval/
-│   └── compare.py              # 4-model comparison + plots
+│   ├── compare.py              # Multi-model comparison + plots + CSV tables
+│   └── bpd.py                  # Test-set NELBO (diffusion) / CE (AR) in bits/token
 ├── proposal/
 │   └── proposal.tex            # LaTeX proposal
 ├── configs/
@@ -189,10 +191,15 @@ python eval/compare.py \
 ```
 
 Produces:
-- `results/task1_table.csv` / `results/task2_table.csv`
-- `results/steps_vs_ppl.png` — quality-speed curve for T ∈ {10, 100, 1000}
-- `results/expert_routing_heatmap.png` — expert utilization vs. noise level t
-- `results/moe_ablation.png` — dense vs. MoE at matched steps
+- `results/task1_table.csv` / `results/task2_table.csv` / `results/unconditional_ppl_table.csv` — per-model metrics
+- `results/all_results.json` — full consolidated results
+- `results/plots/diffusion_steps_ppl.png` — quality-speed curve for T ∈ {10, 100, 1000}
+- `results/plots/infilling_comparison.png` — per-model BLEU-4 and Gen-PPL bar charts
+- `results/plots/constrained_gen_comparison.png` — per-model KW-Sat / MAUVE / Gen-PPL charts
+
+The GPT-2 scorer used for `Gen-PPL` is cached at module level in
+`tasks.infilling._SCORER_CACHE`, so it is loaded once and reused across every
+evaluated model — the first call pays the download, all subsequent calls reuse.
 
 ---
 
@@ -344,11 +351,46 @@ the trained model's capabilities:
 - **MoE expert routing analysis** — expert specialisation across noise levels
 - **Steps vs quality** — quality/speed trade-off across T ∈ {10, 25, 50, 100, 200, 500}
 
+### Baseline Comparison (no training)
+
+[`notebooks/BertDiffused_Baselines.ipynb`](notebooks/BertDiffused_Baselines.ipynb) evaluates
+the trained checkpoint side-by-side with the pretrained AR baselines (GPT-2 117M,
+GPT-2 Medium 345M) on the LM1B test split:
+
+1. **Text infilling** — BLEU-4, Gen-PPL
+2. **Keyword-constrained generation** — KW-Sat %, MAUVE, Gen-PPL
+3. **Unconditional generation** — Gen-PPL with diffusion-steps sweep
+4. **Test-set likelihood** — diffusion NELBO vs. GPT-2 CE, both reported as
+   bits/token via `eval.bpd` so the paradigms share one axis
+
+Checkpoint is loaded from `best_model/best_model.pt` by default (change `CKPT_PATH`
+in the config cell). Outputs (CSV tables + PNG plots + a consolidated JSON)
+land in `results/baselines/`. No training happens — pure evaluation.
+
 ### SUBS Post-processing
 
 Applied to raw MLM head logits after every forward pass:
 1. Set `[MASK]` logit to $-\infty$ — model never outputs a mask token as clean text
 2. For already-unmasked positions, set a one-hot logit — carries over unchanged
+
+---
+
+## Test-Set Likelihood (bits/token)
+
+`eval/bpd.py` provides two functions for a direct, scorer-independent comparison
+on a held-out LM1B test batch:
+
+| Function | Model | Metric |
+|---|---|---|
+| `diffusion_nelbo_per_token` | BertMoEDiffusion | MDLM NELBO, Monte-Carlo over noise levels |
+| `ar_cross_entropy_per_token` | GPT-2 / GPT-2 Medium | Standard causal LM cross-entropy |
+
+Both return nats/token; `nats_to_bits` converts to bits/token for a shared
+axis. Diffusion NELBO is an upper bound on NLL (not exact PPL), so the numbers
+are comparable but not identical in meaning — lower is better for both.
+
+Used by [`notebooks/BertDiffused_Baselines.ipynb`](notebooks/BertDiffused_Baselines.ipynb)
+to rank models on held-out LM1B.
 
 ---
 

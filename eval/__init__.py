@@ -4,6 +4,14 @@ from .compare import (
     plot_infilling_comparison,
     plot_constrained_gen_comparison,
     print_results_table,
+    write_task1_csv,
+    write_task2_csv,
+    write_unconditional_csv,
+)
+from .bpd import (
+    diffusion_nelbo_per_token,
+    ar_cross_entropy_per_token,
+    nats_to_bits,
 )
 
 __all__ = [
@@ -12,4 +20,10 @@ __all__ = [
     "plot_infilling_comparison",
     "plot_constrained_gen_comparison",
     "print_results_table",
+    "write_task1_csv",
+    "write_task2_csv",
+    "write_unconditional_csv",
+    "diffusion_nelbo_per_token",
+    "ar_cross_entropy_per_token",
+    "nats_to_bits",
 ]

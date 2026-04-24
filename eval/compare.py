@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import logging
 from pathlib import Path
@@ -268,6 +269,47 @@ def print_results_table(
     print("=" * 80 + "\n")
 
 
+# ─── CSV writers ──────────────────────────────────────────────────────────────
+
+def write_task1_csv(infilling_results: dict, output_path: str) -> None:
+    """Emit the Task-1 results table (model × {BLEU-4, Gen PPL}) as CSV."""
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["model", "bleu4", "generative_ppl"])
+        for model, metrics in infilling_results.items():
+            w.writerow([model, metrics["bleu4"], metrics["generative_ppl"]])
+    logger.info(f"CSV saved → {output_path}")
+
+
+def write_task2_csv(cg_results: dict, output_path: str) -> None:
+    """Emit the Task-2 results table (model × {KW-Sat, MAUVE, Gen PPL}) as CSV."""
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["model", "keyword_satisfaction_rate", "mauve", "generative_ppl"])
+        for model, metrics in cg_results.items():
+            w.writerow([
+                model,
+                metrics["keyword_satisfaction_rate"],
+                metrics["mauve"],
+                metrics["generative_ppl"],
+            ])
+    logger.info(f"CSV saved → {output_path}")
+
+
+def write_unconditional_csv(unconditional_results: dict, output_path: str) -> None:
+    """Emit the unconditional-PPL sweep (model × T × Gen PPL) as CSV."""
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["model", "diffusion_steps", "generative_ppl"])
+        for model, entries in unconditional_results.items():
+            for T, ppl in entries:
+                w.writerow([model, T if T is not None else "N/A", ppl])
+    logger.info(f"CSV saved → {output_path}")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -328,6 +370,14 @@ def main():
     }
     with open(f"{args.output_dir}/all_results.json", "w") as f:
         json.dump(all_results, f, indent=2)
+
+    # ── CSV tables ────────────────────────────────────────────────────────────
+    write_task1_csv(infilling_results, f"{args.output_dir}/task1_table.csv")
+    write_task2_csv(cg_results, f"{args.output_dir}/task2_table.csv")
+    write_unconditional_csv(
+        unconditional_results,
+        f"{args.output_dir}/unconditional_ppl_table.csv",
+    )
 
     # ── Print table ───────────────────────────────────────────────────────────
     print_results_table(infilling_results, cg_results, unconditional_results)
