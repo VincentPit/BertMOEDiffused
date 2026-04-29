@@ -228,7 +228,8 @@ $$\mathrm{MoE}(h_i) = \sum_{e \in \mathrm{Top\text{-}2}(s_i)} p_{i,e}\,f_e(h_i),
 
 where $W_r \in \mathbb{R}^{8 \times 768}$ is the learned router. Experts 
 $f_e$ are independent 2-layer FFNs (768→3072→768). Only 2 of 8 experts 
-activate per token — same FLOPs as a single dense FFN, but 8× the capacity.
+activate per token — ~2× the FLOPs of a single dense FFN, but 8× the FFN
+capacity (total params: 117M → 275M).
 
 Total training loss with routing regularization:
 

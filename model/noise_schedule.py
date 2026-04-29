@@ -153,10 +153,12 @@ class LogLinearNoiseSchedule:
         is_masked = (z_t == mask_token_id).unsqueeze(-1)  # (B, L, 1)
 
         # Build posterior logits:
-        # For masked positions: logits_x0 shifted by log(token_weight),
-        #                       plus a large weight on mask at log(mask_weight)
-        posterior = logits_x0 + torch.log(p_token_weight.unsqueeze(-1).clamp(min=1e-8))  # (B,L,V)
-        # Set the [MASK] logit to encode p_mask_weight
+        # log_softmax normalises x_theta to a proper distribution before mixing
+        # with the mask weight; without it Categorical(logits=...) under-weights
+        # [MASK] by a factor of sum_v exp(logits_x0[v]) and the chain unmasks
+        # too aggressively (so num_steps stops mattering).
+        log_p_x0 = torch.log_softmax(logits_x0, dim=-1)                                  # (B,L,V)
+        posterior = log_p_x0 + torch.log(p_token_weight.unsqueeze(-1).clamp(min=1e-8))   # (B,L,V)
         posterior[:, :, mask_token_id] = torch.log(p_mask_weight.expand(B, L).clamp(min=1e-8))
 
         # For unmasked positions: one-hot at current token (carry-over)
