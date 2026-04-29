@@ -35,6 +35,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GPT2LMHeadModel
 from sacrebleu.metrics import BLEU
 from datasets import load_dataset
+from tqdm.auto import tqdm
 import numpy as np
 
 from model import BertMoEDiffusion, LogLinearNoiseSchedule
@@ -70,6 +71,7 @@ def build_infilling_examples(
     dataset = load_dataset("lm1b", split=split, streaming=True, trust_remote_code=True)
     examples = []
 
+    pbar = tqdm(total=num_examples, desc="Building examples", unit="ex")
     for item in dataset:
         if len(examples) >= num_examples:
             break
@@ -106,6 +108,8 @@ def build_infilling_examples(
             "real_len": int(real_len),
             "full_text": text,
         })
+        pbar.update(1)
+    pbar.close()
 
     return examples
 
@@ -131,7 +135,11 @@ def diffusion_infill(
     model.set_mask_token_id(mask_id)
 
     results = []
-    for i in range(0, len(examples), batch_size):
+    for i in tqdm(
+        range(0, len(examples), batch_size),
+        desc="Diffusion infilling",
+        unit="batch",
+    ):
         batch_ex = examples[i : i + batch_size]
         B = len(batch_ex)
 
@@ -162,6 +170,7 @@ def diffusion_infill(
             tokenizer=tokenizer,
             device=device,
             fixed_token_mask=fixed_mask,
+            init_z=z,
         )
 
         for j in range(B):
@@ -169,8 +178,6 @@ def diffusion_infill(
             tokens = gen_ids[j, :rl].tolist()
             text = tokenizer.decode(tokens, skip_special_tokens=True)
             results.append(text)
-
-        logger.info(f"  Infilling: {min(i + batch_size, len(examples))}/{len(examples)} done")
 
     return results
 
@@ -194,7 +201,7 @@ def gpt2_infill(
     gpt2_model.eval()
     results = []
 
-    for ex in examples:
+    for ex in tqdm(examples, desc="GPT-2 infilling", unit="ex"):
         prefix_text = bert_tokenizer.decode(
             ex["prefix_ids"].tolist(), skip_special_tokens=True
         )
@@ -264,7 +271,11 @@ def compute_generative_ppl(
     scorer_tok, scorer_model = _get_scorer(scorer_model_name, device)
 
     all_ppls = []
-    for i in range(0, len(texts), batch_size):
+    for i in tqdm(
+        range(0, len(texts), batch_size),
+        desc="Scoring gen PPL",
+        unit="batch",
+    ):
         batch_texts = texts[i : i + batch_size]
         enc = scorer_tok(
             batch_texts,

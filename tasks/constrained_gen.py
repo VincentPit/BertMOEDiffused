@@ -165,6 +165,7 @@ def diffusion_constrained_gen(
             tokenizer=tokenizer,
             device=device,
             fixed_token_mask=fixed_mask,
+            init_z=z,
         )
 
         for j in range(B):

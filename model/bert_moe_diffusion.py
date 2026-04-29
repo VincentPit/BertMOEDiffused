@@ -359,6 +359,7 @@ class BertMoEDiffusion(nn.Module):
         prefix_ids: Optional[torch.Tensor] = None,
         suffix_ids: Optional[torch.Tensor] = None,
         fixed_token_mask: Optional[torch.Tensor] = None,
+        init_z: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Ancestral sampling from the reverse diffusion process.
 
@@ -367,7 +368,8 @@ class BertMoEDiffusion(nn.Module):
 
         Constrained generation: if ``fixed_token_mask`` is provided (bool tensor,
         True = position is fixed/constrained), those positions are pinned to
-        ``prefix_ids``/``suffix_ids`` values and never updated.
+        their values in ``init_z`` (or ``prefix_ids``/``suffix_ids``) and never
+        updated.
 
         Args:
             batch_size:       Number of sequences to generate.
@@ -379,6 +381,10 @@ class BertMoEDiffusion(nn.Module):
             prefix_ids:       (B, prefix_len) or None — for infilling.
             suffix_ids:       (B, suffix_len) or None — for infilling.
             fixed_token_mask: (B, L) bool or None — True = position is fixed.
+            init_z:           (B, L) or None — starting sequence with caller-pinned
+                              tokens already in place (used for per-example variable
+                              prefix/suffix or keyword positions). If None, starts
+                              fully masked.
 
         Returns:
             generated_ids: (B, L) integer token ids of the generated sequences.
@@ -387,8 +393,11 @@ class BertMoEDiffusion(nn.Module):
         mask_id = tokenizer.mask_token_id
         self.mask_token_id = mask_id
 
-        # Start from a fully-masked sequence
-        z = torch.full((batch_size, seq_len), mask_id, dtype=torch.long, device=device)
+        # Start from caller-supplied z if given, else a fully-masked sequence
+        if init_z is not None:
+            z = init_z.to(device).clone()
+        else:
+            z = torch.full((batch_size, seq_len), mask_id, dtype=torch.long, device=device)
 
         # If infilling: place prefix and suffix, mark them as fixed
         if prefix_ids is not None or suffix_ids is not None:
